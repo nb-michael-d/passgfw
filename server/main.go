@@ -9,23 +9,36 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 var (
-	privateKey   *rsa.PrivateKey
-	port         string
-	serverDomain string // Real server domain (configured, not from client)
-	adminUser    string // Admin username for /admin access
-	adminPass    string // Admin password for /admin access
-	adminLocal   bool   // Restrict admin access to localhost only
+	privateKey       *rsa.PrivateKey
+	port             string
+	serverDomain     string // Real server domain (configured, not from client)
+	adminUser        string // Admin username for /admin access
+	adminPass        string // Admin password for /admin access
+	adminLocal       bool   // Restrict admin access to localhost only
+	domainConfigFile string
 )
+
+// clientDomainMap maps client package names to the list of domains they should receive.
+var clientDomainMap atomic.Value
+
+func init() {
+	clientDomainMap.Store(map[string][]string{})
+}
 
 // Built-in private key (matches keys/public_key.pem)
 // This allows the server to run without external key files
@@ -90,11 +103,14 @@ func main() {
 	privateKeyPath := flag.String("private-key", "", "Path to private key (leave empty to use built-in key)")
 	flag.StringVar(&port, "port", "8080", "Server port")
 	flag.StringVar(&serverDomain, "domain", "", "Server domain (e.g., example.com:443)")
+	domainConfigFlag := flag.String("domain-config", "", "Path to JSON file mapping client package names to domains")
 	flag.StringVar(&adminUser, "admin-user", "", "Admin username (leave empty to disable admin auth)")
 	flag.StringVar(&adminPass, "admin-pass", "", "Admin password")
 	flag.BoolVar(&adminLocal, "admin-local", false, "Restrict admin access to localhost only")
 	debug := flag.Bool("debug", false, "Enable debug mode")
 	flag.Parse()
+
+	domainConfigFile = *domainConfigFlag
 
 	log.Println("🚀 PassGFW Server Starting...")
 	log.Println("==============================")
@@ -108,6 +124,24 @@ func main() {
 		log.Printf("✅ Private key loaded: built-in")
 	} else {
 		log.Printf("✅ Private key loaded: %s", *privateKeyPath)
+	}
+
+	// Load client domain mapping configuration if provided
+	if domainConfigFile != "" {
+		count, err := reloadDomainConfig(domainConfigFile)
+		if err != nil {
+			log.Fatalf("❌ Failed to load domain config (%s): %v", domainConfigFile, err)
+		}
+
+		absConfigPath, err := filepath.Abs(domainConfigFile)
+		if err != nil {
+			absConfigPath = domainConfigFile
+		}
+
+		log.Printf("✅ Domain mapping loaded: %s (%d entries)", absConfigPath, count)
+		startDomainConfigWatcher(domainConfigFile, 3*time.Second)
+	} else {
+		log.Printf("ℹ️  Domain mapping config not provided; using built-in routing logic")
 	}
 
 	// Set Gin mode
@@ -244,6 +278,110 @@ func loadPrivateKey(privateKeyPath string) error {
 	return nil
 }
 
+// parseClientDomainConfig loads package-name to domain mappings from a JSON file.
+func parseClientDomainConfig(configPath string) (map[string][]string, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("domain config %s does not exist", configPath)
+		}
+		return nil, fmt.Errorf("read domain config: %w", err)
+	}
+
+	var raw map[string][]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse domain config: %w", err)
+	}
+
+	normalized := make(map[string][]string, len(raw))
+	for pkg, domains := range raw {
+		pkg = strings.TrimSpace(pkg)
+		if pkg == "" {
+			continue
+		}
+
+		cleaned := make([]string, 0, len(domains))
+		for _, domain := range domains {
+			domain = strings.TrimSpace(domain)
+			if domain == "" {
+				continue
+			}
+			cleaned = append(cleaned, domain)
+		}
+
+		if len(cleaned) == 0 {
+			continue
+		}
+
+		normalized[pkg] = cleaned
+	}
+
+	return normalized, nil
+}
+
+func reloadDomainConfig(configPath string) (int, error) {
+	config, err := parseClientDomainConfig(configPath)
+	if err != nil {
+		return 0, err
+	}
+
+	clientDomainMap.Store(config)
+	return len(config), nil
+}
+
+func getClientDomainMap() map[string][]string {
+	value := clientDomainMap.Load()
+	if value == nil {
+		return nil
+	}
+	if config, ok := value.(map[string][]string); ok {
+		return config
+	}
+	return nil
+}
+
+func startDomainConfigWatcher(configPath string, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		lastModTime := time.Time{}
+		if info, err := os.Stat(configPath); err == nil {
+			lastModTime = info.ModTime()
+		} else {
+			log.Printf("⚠️  Domain config watcher could not stat %s: %v", configPath, err)
+		}
+
+		for range ticker.C {
+			info, err := os.Stat(configPath)
+			if err != nil {
+				log.Printf("⚠️  Domain config watcher stat failed: %v", err)
+				continue
+			}
+
+			modTime := info.ModTime()
+			if !modTime.After(lastModTime) {
+				continue
+			}
+
+			count, err := reloadDomainConfig(configPath)
+			if err != nil {
+				log.Printf("❌ Domain config reload failed: %v", err)
+				continue
+			}
+
+			lastModTime = modTime
+
+			absPath := configPath
+			if abs, err := filepath.Abs(configPath); err == nil {
+				absPath = abs
+			}
+
+			log.Printf("♻️  Domain mapping reloaded: %s (%d entries)", absPath, count)
+		}
+	}()
+}
+
 // Handle /passgfw endpoint
 func handlePassGFW(c *gin.Context) {
 	log.Printf("📥 Request from %s", c.ClientIP())
@@ -368,6 +506,12 @@ func handlePassGFW(c *gin.Context) {
 // Get real server domain based on configured domain and client data
 // You can customize this logic to route to different backends
 func getRealDomain(configuredDomain, clientData string) string {
+	if config := getClientDomainMap(); config != nil {
+		if domains, ok := config[clientData]; ok && len(domains) > 0 {
+			return strings.Join(domains, ",")
+		}
+	}
+
 	// Route based on client data
 	// You can add custom logic here based on clientData
 	// For example:

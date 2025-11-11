@@ -1,0 +1,11 @@
+{
+  "com.yourcompany.app": [
+    "api.yourcompany.com",
+    "www.yourcompany.com",
+    "ws.yourcompany.com"
+  ],
+  "test.package": [
+    "test-api.example.com",
+    "test-www.example.com"
+  ]
+}
